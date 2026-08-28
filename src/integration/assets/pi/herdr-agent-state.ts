@@ -2,7 +2,7 @@
 // managed by herdr; reinstalling or updating the integration overwrites this file.
 // add custom hooks/plugins beside this file instead of editing it.
 // HERDR_INTEGRATION_ID=pi
-// HERDR_INTEGRATION_VERSION=8
+// HERDR_INTEGRATION_VERSION=9
 // @ts-nocheck
 
 import net from "node:net";
@@ -54,6 +54,66 @@ async function sendRequest(request: unknown): Promise<void> {
 }
 
 type AgentState = "working" | "blocked" | "idle";
+
+// pi-subagents persists an async launch as a tool result whose details carry
+// status "started" and a run id; completion arrives later as a
+// "subagent_result" custom message with the same id. Unmatched launches mean
+// children are still running and will steer results back into this session.
+const SUBAGENT_LAUNCH_TOOLS = new Set(["subagent", "subagent_resume"]);
+const SUBAGENT_RESULT_CUSTOM_TYPE = "subagent_result";
+
+function isRecord(value: unknown): value is Record<string, any> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function collectStartedRunIds(details: unknown, into: Set<string>): void {
+  if (!isRecord(details)) {
+    return;
+  }
+  if (details.status === "started" && typeof details.id === "string") {
+    into.add(details.id);
+  }
+  if (Array.isArray(details.children)) {
+    for (const child of details.children) {
+      collectStartedRunIds(child, into);
+    }
+  }
+}
+
+function pendingSubagentRunIds(entries: unknown): Set<string> {
+  const started = new Set<string>();
+  if (!Array.isArray(entries)) {
+    return started;
+  }
+  for (const entry of entries) {
+    if (!isRecord(entry)) {
+      continue;
+    }
+    const message = isRecord(entry.message) ? entry.message : undefined;
+    if (
+      entry.type === "message" &&
+      message?.role === "toolResult" &&
+      SUBAGENT_LAUNCH_TOOLS.has(message.toolName)
+    ) {
+      collectStartedRunIds(message.details, started);
+      continue;
+    }
+    const customType =
+      entry.type === "custom_message"
+        ? entry.customType
+        : message?.role === "custom"
+          ? message.customType
+          : undefined;
+    if (customType !== SUBAGENT_RESULT_CUSTOM_TYPE) {
+      continue;
+    }
+    const details = isRecord(entry.details) ? entry.details : message?.details;
+    if (isRecord(details) && typeof details.id === "string") {
+      started.delete(details.id);
+    }
+  }
+  return started;
+}
 
 type QueuedState = {
   state: AgentState;
@@ -178,11 +238,31 @@ export default function (pi) {
   }
 
   let agentActive = false;
+  let pendingSubagents = 0;
+  // Run ids already pending when this extension loads can never steer results
+  // back (pi-subagents tracks runs in memory), so they are ignored forever.
+  let orphanedSubagentRunIds = new Set<string>();
   let blockedCount = 0;
   let blockedMessage: string | undefined;
   let lastState: AgentState | undefined;
   let lastMessage: string | undefined;
   let rootSession = false;
+
+  function countPendingSubagents(ctx: any): number {
+    let entries: unknown;
+    try {
+      entries = ctx?.sessionManager?.getEntries?.();
+    } catch {
+      return pendingSubagents;
+    }
+    let pending = 0;
+    for (const id of pendingSubagentRunIds(entries)) {
+      if (!orphanedSubagentRunIds.has(id)) {
+        pending += 1;
+      }
+    }
+    return pending;
+  }
 
   function desiredState() {
     if (blockedCount > 0) {
@@ -190,6 +270,13 @@ export default function (pi) {
     }
     if (agentActive) {
       return { state: "working" as const, message: undefined };
+    }
+    if (pendingSubagents > 0) {
+      return {
+        state: "working" as const,
+        message:
+          pendingSubagents === 1 ? "1 subagent running" : `${pendingSubagents} subagents running`,
+      };
     }
     return { state: "idle" as const, message: undefined };
   }
@@ -233,6 +320,12 @@ export default function (pi) {
     await reportSession(event?.reason);
     // A reload can replace this extension mid-run without emitting another agent_start.
     agentActive = ctx?.isIdle?.() === false;
+    try {
+      orphanedSubagentRunIds = pendingSubagentRunIds(ctx?.sessionManager?.getEntries?.());
+    } catch {
+      orphanedSubagentRunIds = new Set();
+    }
+    pendingSubagents = 0;
     publishState(true);
   });
 
@@ -252,6 +345,7 @@ export default function (pi) {
     }
 
     agentActive = false;
+    pendingSubagents = countPendingSubagents(ctx);
     publishState();
   });
 }
