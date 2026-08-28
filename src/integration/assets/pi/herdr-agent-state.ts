@@ -2,7 +2,7 @@
 // managed by herdr; reinstalling or updating the integration overwrites this file.
 // add custom hooks/plugins beside this file instead of editing it.
 // HERDR_INTEGRATION_ID=pi
-// HERDR_INTEGRATION_VERSION=9
+// HERDR_INTEGRATION_VERSION=10
 // @ts-nocheck
 
 import net from "node:net";
@@ -99,21 +99,84 @@ function pendingSubagentRunIds(entries: unknown): Set<string> {
       collectStartedRunIds(message.details, started);
       continue;
     }
-    let customType: unknown;
-    if (entry.type === "custom_message") {
-      customType = entry.customType;
-    } else if (message?.role === "custom") {
-      customType = message.customType;
-    }
-    if (customType !== SUBAGENT_RESULT_CUSTOM_TYPE) {
+    const signal = entryCustomSignal(entry, message);
+    if (signal?.customType !== SUBAGENT_RESULT_CUSTOM_TYPE) {
       continue;
     }
-    const details = isRecord(entry.details) ? entry.details : message?.details;
-    if (isRecord(details) && typeof details.id === "string") {
-      started.delete(details.id);
+    if (isRecord(signal.details) && typeof signal.details.id === "string") {
+      started.delete(signal.details.id);
     }
   }
   return started;
+}
+
+// pi-background-tasks returns a running task snapshot from its launch tools
+// and sends a terminal "background-task-notification" custom message with the
+// same task id when it finishes. Tasks launched with notifyOnCompletion:false
+// never emit one, so they must not count — they would hold the pane forever.
+const BG_RUN_TOOLS = new Set(["bg_run", "bg_run_pi_attested"]);
+const BG_NOTIFICATION_CUSTOM_TYPE = "background-task-notification";
+
+function entryCustomSignal(
+  entry: Record<string, unknown>,
+  message: Record<string, unknown> | undefined,
+): { customType: unknown; details: unknown } | undefined {
+  if (entry.type === "custom_message") {
+    return { customType: entry.customType, details: entry.details };
+  }
+  if (message?.role === "custom") {
+    return { customType: message.customType, details: message.details };
+  }
+  return undefined;
+}
+
+function pendingBackgroundTaskIds(entries: unknown): Set<string> {
+  const running = new Set<string>();
+  if (!Array.isArray(entries)) {
+    return running;
+  }
+  for (const entry of entries) {
+    if (!isRecord(entry)) {
+      continue;
+    }
+    const message = isRecord(entry.message) ? entry.message : undefined;
+    if (
+      entry.type === "message" &&
+      message?.role === "toolResult" &&
+      typeof message.toolName === "string" &&
+      BG_RUN_TOOLS.has(message.toolName)
+    ) {
+      const task = isRecord(message.details) ? message.details.task : undefined;
+      if (
+        isRecord(task) &&
+        task.status === "running" &&
+        typeof task.id === "string" &&
+        task.notifyOnCompletion !== false
+      ) {
+        running.add(task.id);
+      }
+      continue;
+    }
+    const signal = entryCustomSignal(entry, message);
+    if (signal?.customType !== BG_NOTIFICATION_CUSTOM_TYPE) {
+      continue;
+    }
+    if (isRecord(signal.details) && typeof signal.details.id === "string") {
+      running.delete(signal.details.id);
+    }
+  }
+  return running;
+}
+
+function runningWorkMessage(subagents: number, backgroundTasks: number): string | undefined {
+  const parts: string[] = [];
+  if (subagents > 0) {
+    parts.push(subagents === 1 ? "1 subagent" : `${subagents} subagents`);
+  }
+  if (backgroundTasks > 0) {
+    parts.push(backgroundTasks === 1 ? "1 background task" : `${backgroundTasks} background tasks`);
+  }
+  return parts.length > 0 ? `${parts.join(", ")} running` : undefined;
 }
 
 type QueuedState = {
@@ -240,29 +303,40 @@ export default function (pi) {
 
   let agentActive = false;
   let pendingSubagents = 0;
-  // Run ids already pending when this extension loads can never steer results
-  // back (pi-subagents tracks runs in memory), so they are ignored forever.
+  let pendingBackgroundTasks = 0;
+  // Runs and tasks already pending when this extension loads can never report
+  // back (pi-subagents tracks runs in memory; pi-background-tasks kills its
+  // tasks on reload), so they are ignored forever.
   let orphanedSubagentRunIds = new Set<string>();
+  let orphanedBackgroundTaskIds = new Set<string>();
   let blockedCount = 0;
   let blockedMessage: string | undefined;
   let lastState: AgentState | undefined;
   let lastMessage: string | undefined;
   let rootSession = false;
 
-  function countPendingSubagents(ctx: any): number {
+  function countUnmatched(pending: Set<string>, orphaned: Set<string>): number {
+    let count = 0;
+    for (const id of pending) {
+      if (!orphaned.has(id)) {
+        count += 1;
+      }
+    }
+    return count;
+  }
+
+  function refreshPendingWork(ctx: any): void {
     let entries: unknown;
     try {
       entries = ctx?.sessionManager?.getEntries?.();
     } catch {
-      return pendingSubagents;
+      return;
     }
-    let pending = 0;
-    for (const id of pendingSubagentRunIds(entries)) {
-      if (!orphanedSubagentRunIds.has(id)) {
-        pending += 1;
-      }
-    }
-    return pending;
+    pendingSubagents = countUnmatched(pendingSubagentRunIds(entries), orphanedSubagentRunIds);
+    pendingBackgroundTasks = countUnmatched(
+      pendingBackgroundTaskIds(entries),
+      orphanedBackgroundTaskIds,
+    );
   }
 
   function desiredState() {
@@ -272,12 +346,9 @@ export default function (pi) {
     if (agentActive) {
       return { state: "working" as const, message: undefined };
     }
-    if (pendingSubagents > 0) {
-      return {
-        state: "working" as const,
-        message:
-          pendingSubagents === 1 ? "1 subagent running" : `${pendingSubagents} subagents running`,
-      };
+    const pendingWorkMessage = runningWorkMessage(pendingSubagents, pendingBackgroundTasks);
+    if (pendingWorkMessage) {
+      return { state: "working" as const, message: pendingWorkMessage };
     }
     return { state: "idle" as const, message: undefined };
   }
@@ -322,11 +393,15 @@ export default function (pi) {
     // A reload can replace this extension mid-run without emitting another agent_start.
     agentActive = ctx?.isIdle?.() === false;
     try {
-      orphanedSubagentRunIds = pendingSubagentRunIds(ctx?.sessionManager?.getEntries?.());
+      const entries = ctx?.sessionManager?.getEntries?.();
+      orphanedSubagentRunIds = pendingSubagentRunIds(entries);
+      orphanedBackgroundTaskIds = pendingBackgroundTaskIds(entries);
     } catch {
       orphanedSubagentRunIds = new Set();
+      orphanedBackgroundTaskIds = new Set();
     }
     pendingSubagents = 0;
+    pendingBackgroundTasks = 0;
     publishState(true);
   });
 
@@ -346,7 +421,7 @@ export default function (pi) {
     }
 
     agentActive = false;
-    pendingSubagents = countPendingSubagents(ctx);
+    refreshPendingWork(ctx);
     publishState();
   });
 }

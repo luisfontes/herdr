@@ -391,6 +391,71 @@ test("Pi ignores subagent runs that were already pending when the session loaded
   expect(requestStates(requests)).toEqual(["idle"]);
 });
 
+test("Pi keeps working while background tasks run and settles after their notifications", async () => {
+  const requests = await startRecordingServer("pi-bg-tasks");
+  const { handlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./pi/herdr-agent-state.ts");
+  install(pi);
+
+  let idle = true;
+  let entries: unknown[] = [];
+  const context = piContextWithEntries(
+    () => idle,
+    () => entries,
+  );
+  await handlers.get("session_start")?.({ reason: "startup" }, context);
+  await waitFor(() => requestStates(requests).length === 1);
+
+  // A running bg_run task holds the pane working after the loop settles.
+  idle = true;
+  entries = [bgRunEntry("task1")];
+  handlers.get("agent_settled")?.({}, context);
+  await waitFor(() => requestStates(requests).length === 2);
+  expect(requestStates(requests)).toEqual(["idle", "working"]);
+  expect(requestMessage(requests[1])).toBe("1 background task running");
+
+  // Tasks that opted out of completion notifications never emit one, so they
+  // must not hold the pane.
+  entries = [...entries, bgRunEntry("task2", { notifyOnCompletion: false })];
+  handlers.get("agent_settled")?.({}, context);
+  await Bun.sleep(25);
+  expect(requestStates(requests)).toHaveLength(2);
+
+  // Subagents and background tasks combine in the working message.
+  entries = [...entries, subagentLaunchEntry("sub1")];
+  handlers.get("agent_settled")?.({}, context);
+  await waitFor(() => requestStates(requests).length === 3);
+  expect(requestMessage(requests[2])).toBe("1 subagent, 1 background task running");
+
+  // The completion notification clears the task; the subagent result clears
+  // the run; only then does the pane go idle.
+  entries = [...entries, bgNotificationEntry("task1"), subagentResultEntry("sub1")];
+  handlers.get("agent_settled")?.({}, context);
+  await waitFor(() => requestStates(requests).length === 4);
+  expect(requestStates(requests)).toEqual(["idle", "working", "working", "idle"]);
+});
+
+test("Pi ignores background tasks that were running when the session loaded", async () => {
+  const requests = await startRecordingServer("pi-bg-tasks-orphaned");
+  const { handlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./pi/herdr-agent-state.ts");
+  install(pi);
+
+  // pi-background-tasks kills its tasks on reload and never reattaches, so a
+  // still-running task from before this process loaded is already gone.
+  const entries = [bgRunEntry("stale-task")];
+  const context = piContextWithEntries(
+    () => true,
+    () => entries,
+  );
+  await handlers.get("session_start")?.({ reason: "reload" }, context);
+  await waitFor(() => requestStates(requests).length === 1);
+
+  handlers.get("agent_settled")?.({}, context);
+  await Bun.sleep(25);
+  expect(requestStates(requests)).toEqual(["idle"]);
+});
+
 test("Pi reports the session replacement source", async () => {
   const requests = await startRecordingServer("pi-session-source");
   const { handlers, pi } = createExtensionHarness();
@@ -710,6 +775,33 @@ function subagentResultMessageEntry(id: string) {
       customType: "subagent_result",
       details: { id, name: `agent-${id}`, status: "completed" },
     },
+  };
+}
+
+function bgRunEntry(id: string, options: { notifyOnCompletion?: boolean } = {}) {
+  return {
+    type: "message",
+    message: {
+      role: "toolResult",
+      toolName: "bg_run",
+      details: {
+        task: {
+          id,
+          name: `task-${id}`,
+          command: "sleep 30",
+          status: "running",
+          notifyOnCompletion: options.notifyOnCompletion ?? true,
+        },
+      },
+    },
+  };
+}
+
+function bgNotificationEntry(id: string) {
+  return {
+    type: "custom_message",
+    customType: "background-task-notification",
+    details: { id, name: `task-${id}`, status: "completed" },
   };
 }
 
