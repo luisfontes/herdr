@@ -315,6 +315,82 @@ test("Pi settlement preserves explicit blocked-state precedence", async () => {
   expect(requestStates(requests)).toEqual(["idle", "working", "blocked", "idle"]);
 });
 
+test("Pi keeps working while subagents run and settles idle after their results", async () => {
+  const requests = await startRecordingServer("pi-subagents");
+  const { handlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./pi/herdr-agent-state.ts");
+  install(pi);
+
+  let idle = true;
+  let entries: unknown[] = [];
+  const context = piContextWithEntries(
+    () => idle,
+    () => entries,
+  );
+  await handlers.get("session_start")?.({ reason: "startup" }, context);
+  await waitFor(() => requestStates(requests).length === 1);
+
+  idle = false;
+  handlers.get("agent_start")?.({}, context);
+  await waitFor(() => requestStates(requests).length === 2);
+
+  // The main loop settles while an async subagent is still running: the pane
+  // stays working and names the running children instead of going idle.
+  idle = true;
+  entries = [subagentLaunchEntry("aaa111")];
+  handlers.get("agent_settled")?.({}, context);
+  await waitFor(() => requestStates(requests).length === 3);
+  expect(requestStates(requests)).toEqual(["idle", "working", "working"]);
+  expect(requestMessage(requests[2])).toBe("1 subagent running");
+
+  // A batch launch adds two more running children.
+  entries = [...entries, subagentBatchLaunchEntry(["bbb222", "ccc333"])];
+  handlers.get("agent_settled")?.({}, context);
+  await waitFor(() => requestStates(requests).length === 4);
+  expect(requestMessage(requests[3])).toBe("3 subagents running");
+
+  // Completions arrive as subagent_result custom messages (either entry
+  // shape); the pane goes idle only once the last child reports back.
+  entries = [...entries, subagentResultEntry("aaa111")];
+  handlers.get("agent_settled")?.({}, context);
+  await waitFor(() => requestStates(requests).length === 5);
+  expect(requestMessage(requests[4])).toBe("2 subagents running");
+
+  entries = [...entries, subagentResultMessageEntry("bbb222"), subagentResultEntry("ccc333")];
+  handlers.get("agent_settled")?.({}, context);
+  await waitFor(() => requestStates(requests).length === 6);
+  expect(requestStates(requests)).toEqual([
+    "idle",
+    "working",
+    "working",
+    "working",
+    "working",
+    "idle",
+  ]);
+});
+
+test("Pi ignores subagent runs that were already pending when the session loaded", async () => {
+  const requests = await startRecordingServer("pi-subagents-orphaned");
+  const { handlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./pi/herdr-agent-state.ts");
+  install(pi);
+
+  // pi-subagents tracks runs in memory, so a started launch from before this
+  // process loaded can never steer its result back; it must not wedge the
+  // pane into a permanent working state after a resume.
+  const entries = [subagentLaunchEntry("stale1")];
+  const context = piContextWithEntries(
+    () => true,
+    () => entries,
+  );
+  await handlers.get("session_start")?.({ reason: "resume" }, context);
+  await waitFor(() => requestStates(requests).length === 1);
+
+  handlers.get("agent_settled")?.({}, context);
+  await Bun.sleep(25);
+  expect(requestStates(requests)).toEqual(["idle"]);
+});
+
 test("Pi reports the session replacement source", async () => {
   const requests = await startRecordingServer("pi-session-source");
   const { handlers, pi } = createExtensionHarness();
@@ -579,6 +655,70 @@ test("Pi retries working state after an unanswered socket attempt", async () => 
   expect(attemptedRequests[1]).toEqual(attemptedRequests[0]);
   expect(reportedWorking()).toBe(true);
 });
+
+function piContextWithEntries(isIdle: () => boolean, entries: () => unknown[]) {
+  return {
+    hasUI: true,
+    mode: "tui",
+    isIdle,
+    sessionManager: {
+      getSessionFile: () => undefined,
+      getSessionId: () => undefined,
+      getEntries: entries,
+    },
+  };
+}
+
+function subagentLaunchEntry(id: string) {
+  return {
+    type: "message",
+    message: {
+      role: "toolResult",
+      toolName: "subagent",
+      details: { id, name: `agent-${id}`, status: "started", async: true },
+    },
+  };
+}
+
+function subagentBatchLaunchEntry(ids: string[]) {
+  return {
+    type: "message",
+    message: {
+      role: "toolResult",
+      toolName: "subagent",
+      details: {
+        status: "started",
+        children: ids.map((id) => ({ id, name: `agent-${id}`, status: "started", async: true })),
+      },
+    },
+  };
+}
+
+function subagentResultEntry(id: string) {
+  return {
+    type: "custom_message",
+    customType: "subagent_result",
+    details: { id, name: `agent-${id}`, status: "completed" },
+  };
+}
+
+function subagentResultMessageEntry(id: string) {
+  return {
+    type: "message",
+    message: {
+      role: "custom",
+      customType: "subagent_result",
+      details: { id, name: `agent-${id}`, status: "completed" },
+    },
+  };
+}
+
+function requestMessage(request: unknown): unknown {
+  if (!isRecord(request) || !isRecord(request.params)) {
+    return undefined;
+  }
+  return request.params.message;
+}
 
 function completionHandlers(handlers: Map<string, Handler>): string[] {
   return ["agent_end", "agent_settled"].filter((event) => handlers.has(event));
