@@ -62,7 +62,7 @@ type AgentState = "working" | "blocked" | "idle";
 const SUBAGENT_LAUNCH_TOOLS = new Set(["subagent", "subagent_resume"]);
 const SUBAGENT_RESULT_CUSTOM_TYPE = "subagent_result";
 
-function isRecord(value: unknown): value is Record<string, any> {
+function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
@@ -93,17 +93,18 @@ function pendingSubagentRunIds(entries: unknown): Set<string> {
     if (
       entry.type === "message" &&
       message?.role === "toolResult" &&
+      typeof message.toolName === "string" &&
       SUBAGENT_LAUNCH_TOOLS.has(message.toolName)
     ) {
       collectStartedRunIds(message.details, started);
       continue;
     }
-    const customType =
-      entry.type === "custom_message"
-        ? entry.customType
-        : message?.role === "custom"
-          ? message.customType
-          : undefined;
+    let customType: unknown;
+    if (entry.type === "custom_message") {
+      customType = entry.customType;
+    } else if (message?.role === "custom") {
+      customType = message.customType;
+    }
     if (customType !== SUBAGENT_RESULT_CUSTOM_TYPE) {
       continue;
     }
